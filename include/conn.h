@@ -11,6 +11,7 @@
 typedef struct {
     int listen_fd;
     int socket_fd;
+    bool no_ack_mode;
 
     pktbuf_t pktbuf;
 } conn_t;

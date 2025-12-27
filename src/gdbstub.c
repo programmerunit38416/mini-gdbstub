@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/select.h>
+#include <sys/socket.h>
 #include "conn.h"
 #include "gdb_signal.h"
 #include "packet.h"
@@ -17,6 +18,7 @@ struct gdbstub_private {
 
     pthread_t tid;
     bool async_io_enable;
+    bool no_ack_mode;
     void *args;
 };
 
@@ -60,12 +62,27 @@ static void *socket_reader(gdbstub_t *gdbstub)
 
         if (result > 0 && FD_ISSET(socket_fd, &readfds)) {
             char ch;
-            ssize_t nread = read(socket_fd, &ch, 1);
+            /* Use MSG_PEEK to look at the byte without consuming it.
+             * Only consume if it's the interrupt character (0x03).
+             * This prevents the socket_reader from eating regular packet data. */
+            ssize_t nread = recv(socket_fd, &ch, 1, MSG_PEEK);
             if (nread == 1 && ch == INTR_CHAR) {
+                /* Consume the interrupt character */
+                read(socket_fd, &ch, 1);
                 gdbstub->ops->on_interrupt(args);
+            } else if (nread == 0) {
+                /* Connection closed by peer - signal interrupt to wake up any waiting threads */
+                gdbstub->ops->on_interrupt(args);
+                break;
+            } else if (nread < 0) {
+                /* Socket error - connection lost */
+                gdbstub->ops->on_interrupt(args);
+                break;
             }
+            /* If not INTR_CHAR, leave it in the buffer for the main thread */
         } else if (result < 0) {
             perror("select error in socket_reader");
+            gdbstub->ops->on_interrupt(args);
             break;
         }
     }
@@ -140,6 +157,7 @@ static gdb_event_t process_cont(gdbstub_t *gdbstub)
 static void process_reg_read(gdbstub_t *gdbstub, void *args)
 {
     char packet_str[MAX_SEND_PACKET_SIZE];
+    size_t offset = 0;
 
     for (int i = 0; i < gdbstub->arch.reg_num; i++) {
         size_t reg_sz = gdbstub->ops->get_reg_bytes(i);
@@ -153,13 +171,14 @@ static void process_reg_read(gdbstub_t *gdbstub, void *args)
                reg_sz);
 #endif
         if (!ret) {
-            hex_to_str((uint8_t *) reg_value, &packet_str[i * reg_sz * 2],
-                       reg_sz);
+            hex_to_str((uint8_t *) reg_value, &packet_str[offset], reg_sz);
+            offset += reg_sz * 2;
         } else {
             sprintf(packet_str, "E%d", ret);
             break;
         }
     }
+    packet_str[offset] = '\0';
 
     conn_send_pktstr(&gdbstub->priv->conn, packet_str);
 }
@@ -374,45 +393,98 @@ static void process_query(gdbstub_t *gdbstub, char *payload, void *args)
     if (!strcmp(name, "C")) {
         if (gdbstub->ops->get_cpu != NULL) {
             int cpuid = gdbstub->ops->get_cpu(args);
-            sprintf(packet_str, "QC%04d", cpuid);
+            /* Thread ID in hex format, matching qfThreadInfo */
+            sprintf(packet_str, "QC%04x", cpuid);
             conn_send_pktstr(&gdbstub->priv->conn, packet_str);
         } else
             conn_send_pktstr(&gdbstub->priv->conn, "");
     } else if (!strcmp(name, "Supported")) {
+        char supported[256] = "PacketSize=1024";
         if (gdbstub->arch.target_desc != NULL)
-            conn_send_pktstr(&gdbstub->priv->conn,
-                             "PacketSize=1024;qXfer:features:read+");
-        else
-            conn_send_pktstr(&gdbstub->priv->conn, "PacketSize=1024");
+            strcat(supported, ";qXfer:features:read+");
+        if (gdbstub->ops->set_bp != NULL)
+            strcat(supported, ";swbreak+");
+        conn_send_pktstr(&gdbstub->priv->conn, supported);
     } else if (!strcmp(name, "Attached")) {
         /* assume attached to an existing process */
         conn_send_pktstr(&gdbstub->priv->conn, "1");
+    } else if (!strcmp(name, "HostInfo")) {
+        /* Provide minimal host info for lldb-dap */
+        conn_send_pktstr(&gdbstub->priv->conn,
+            "triple:6502-unknown-none;endian:little;ptrsize:2;");
+    } else if (!strcmp(name, "ProcessInfo")) {
+        /* Provide minimal process info */
+        conn_send_pktstr(&gdbstub->priv->conn,
+            "pid:1;triple:6502-unknown-none;endian:little;ptrsize:2;");
     } else if (!strcmp(name, "Xfer")) {
         process_xfer(gdbstub, qargs);
     } else if (!strcmp(name, "Symbol")) {
         conn_send_pktstr(&gdbstub->priv->conn, "OK");
+    } else if (!strcmp(name, "Offsets")) {
+        /* Tell LLDB that code/data are loaded at ELF addresses (no relocation) */
+        conn_send_pktstr(&gdbstub->priv->conn, "Text=0;Data=0");
     } else if (!strcmp(name, "fThreadInfo")) {
-        /* Assume at least 1 CPU if user didn't specific
-         * the CPU counts */
+        /* Assume at least 1 CPU if user didn't specify
+         * the CPU counts. Use thread IDs starting from 1.
+         * LLDB requires non-zero thread IDs (tid=0 is reserved for "any thread").
+         * Format as hex to match LLDB's GetPidTid() parsing. */
         int smp = gdbstub->arch.smp ? gdbstub->arch.smp : 1;
         char *ptr;
-        char cpuid_str[6];
-
-        /* Make assumption on the CPU counts, so
-         * that we can use the buffer very simply. */
-        assert(smp < 10000);
 
         packet_str[0] = 'm';
         ptr = packet_str + 1;
-        for (int cpuid = 0; cpuid < smp; cpuid++) {
-            sprintf(cpuid_str, "%04d,", cpuid);
-            memcpy(ptr, cpuid_str, 5);
-            ptr += 5;
+        for (int cpuid = 1; cpuid <= smp; cpuid++) {
+            ptr += sprintf(ptr, "%04x", cpuid);
+            if (cpuid < smp)
+                *ptr++ = ',';
         }
-        *ptr = 0;
+        *ptr = '\0';
         conn_send_pktstr(&gdbstub->priv->conn, packet_str);
     } else if (!strcmp(name, "sThreadInfo")) {
         conn_send_pktstr(&gdbstub->priv->conn, "l");
+    } else if (!strncmp(name, "RegisterInfo", 12)) {
+        /* qRegisterInfoN - LLDB uses this to get register metadata
+         * Format: name:val;bitsize:N;offset:N;encoding:uint;format:hex;set:GPR;
+         * For 6502: A, X, Y, P (flags), SP, PC */
+        int regno = 0;
+        sscanf(name + 12, "%x", &regno);
+
+        switch (regno) {
+        case 0:
+            conn_send_pktstr(&gdbstub->priv->conn,
+                "name:a;bitsize:8;offset:0;encoding:uint;format:hex;"
+                "set:General Purpose Registers;gcc:0;dwarf:0;");
+            break;
+        case 1:
+            conn_send_pktstr(&gdbstub->priv->conn,
+                "name:x;bitsize:8;offset:1;encoding:uint;format:hex;"
+                "set:General Purpose Registers;gcc:1;dwarf:1;");
+            break;
+        case 2:
+            conn_send_pktstr(&gdbstub->priv->conn,
+                "name:y;bitsize:8;offset:2;encoding:uint;format:hex;"
+                "set:General Purpose Registers;gcc:2;dwarf:2;");
+            break;
+        case 3:
+            conn_send_pktstr(&gdbstub->priv->conn,
+                "name:flags;alt-name:p;bitsize:8;offset:3;encoding:uint;format:hex;"
+                "set:General Purpose Registers;gcc:3;dwarf:3;generic:flags;");
+            break;
+        case 4:
+            conn_send_pktstr(&gdbstub->priv->conn,
+                "name:sp;bitsize:8;offset:4;encoding:uint;format:hex;"
+                "set:General Purpose Registers;gcc:4;dwarf:4;generic:sp;");
+            break;
+        case 5:
+            conn_send_pktstr(&gdbstub->priv->conn,
+                "name:pc;bitsize:16;offset:5;encoding:uint;format:hex;"
+                "set:General Purpose Registers;gcc:5;dwarf:5;generic:pc;");
+            break;
+        default:
+            /* End of register list */
+            conn_send_pktstr(&gdbstub->priv->conn, "E45");
+            break;
+        }
     } else {
         conn_send_pktstr(&gdbstub->priv->conn, "");
     }
@@ -546,8 +618,14 @@ static void process_set_cpu(gdbstub_t *gdbstub, char *payload, void *args)
     /* We don't support deprecated Hc packet, GDB
      * should send only send vCont;c and vCont;s here. */
     if (payload[0] == 'g') {
-        assert(sscanf(payload, "g%d", &cpuid) == 1);
-        gdbstub->ops->set_cpu(args, cpuid);
+        if (payload[1] == '-') {
+            cpuid = -1;  // All threads
+        } else {
+            assert(sscanf(&payload[1], "%x", &cpuid) == 1);
+        }
+        if (gdbstub->ops->set_cpu != NULL) {
+            gdbstub->ops->set_cpu(args, cpuid);
+        }
     }
     conn_send_pktstr(&gdbstub->priv->conn, "OK");
 }
@@ -585,6 +663,30 @@ static gdb_event_t gdbstub_process_packet(gdbstub_t *gdbstub,
     case 'c':
         event = process_cont(gdbstub);
         break;
+    case 's':
+        /* Single step instruction */
+        if (gdbstub->ops->stepi != NULL)
+            event = EVENT_STEP;
+        else
+            SEND_EPERM(gdbstub);
+        break;
+    case 'j':
+        /* jThreadsInfo - LLDB extension for extended thread info */
+        if (strncmp(payload, "ThreadsInfo", 11) == 0) {
+            /* Return JSON array with thread info
+             * LLDB expects: [{"tid":1,"name":"main",...}] */
+            char json[256];
+            uint8_t pc_val[2];
+            uint16_t pc_addr = 0;
+            if (gdbstub->ops->read_reg && gdbstub->ops->read_reg(args, 5, pc_val) == 0) {
+                pc_addr = pc_val[0] | (pc_val[1] << 8);
+            }
+            sprintf(json, "[{\"tid\":1,\"name\":\"main\",\"reason\":\"none\"}]");
+            conn_send_pktstr(&gdbstub->priv->conn, json);
+        } else {
+            conn_send_pktstr(&gdbstub->priv->conn, "");
+        }
+        break;
     case 'g':
         if (gdbstub->ops->read_reg != NULL) {
             process_reg_read(gdbstub, args);
@@ -620,7 +722,12 @@ static gdb_event_t gdbstub_process_packet(gdbstub_t *gdbstub,
         }
         break;
     case '?':
-        conn_send_pktstr(&gdbstub->priv->conn, "S05");
+        {
+            /* Use simple S packet for maximum compatibility */
+            char stop_reply[128];
+            sprintf(stop_reply, "S%02x", GDB_SIGNAL_TRAP);
+            conn_send_pktstr(&gdbstub->priv->conn, stop_reply);
+        }
         break;
     case 'D':
         event = EVENT_DETACH;
@@ -676,6 +783,21 @@ static gdb_event_t gdbstub_process_packet(gdbstub_t *gdbstub,
             SEND_EPERM(gdbstub);
         }
         break;
+    case 'Q':
+        /* Handle LLDB-specific Q packets */
+        if (strncmp(payload, "StartNoAckMode", 14) == 0) {
+            conn_send_pktstr(&gdbstub->priv->conn, "OK");
+            gdbstub->priv->conn.no_ack_mode = true;
+        } else if (strncmp(payload, "ThreadSuffixSupported", 21) == 0) {
+            conn_send_pktstr(&gdbstub->priv->conn, "OK");
+        } else if (strncmp(payload, "ListThreadsInStopReply", 22) == 0) {
+            conn_send_pktstr(&gdbstub->priv->conn, "OK");
+        } else if (strncmp(payload, "EnableErrorStrings", 18) == 0) {
+            conn_send_pktstr(&gdbstub->priv->conn, "OK");
+        } else {
+            conn_send_pktstr(&gdbstub->priv->conn, "");
+        }
+        break;
     default:
         conn_send_pktstr(&gdbstub->priv->conn, "");
         break;
@@ -709,9 +831,12 @@ static gdb_action_t gdbstub_handle_event(gdbstub_t *gdbstub,
     return act;
 }
 
-static void gdbstub_act_resume(gdbstub_t *gdbstub)
+static void gdbstub_act_resume(gdbstub_t *gdbstub, void *args)
 {
-    char packet_str[32];
+    char packet_str[256];
+
+    /* Use simplest S packet format for maximum compatibility
+     * S05 = stopped with SIGTRAP */
     sprintf(packet_str, "S%02x", GDB_SIGNAL_TRAP);
     conn_send_pktstr(&gdbstub->priv->conn, packet_str);
 }
@@ -731,16 +856,20 @@ bool gdbstub_run(gdbstub_t *gdbstub, void *args)
     while (true) {
         conn_recv_packet(&gdbstub->priv->conn);
         packet_t *pkt = conn_pop_packet(&gdbstub->priv->conn);
-#ifdef DEBUG
-        printf("packet = %s\n", pkt->data);
-#endif
+
+        // NULL packet means connection was closed
+        if (pkt == NULL) {
+            return true;
+        }
+
         gdb_event_t event = gdbstub_process_packet(gdbstub, pkt, args);
         free(pkt);
 
         gdb_action_t act = gdbstub_handle_event(gdbstub, event, args);
+
         switch (act) {
         case ACT_RESUME:
-            gdbstub_act_resume(gdbstub);
+            gdbstub_act_resume(gdbstub, args);
             break;
         case ACT_SHUTDOWN:
             return true;

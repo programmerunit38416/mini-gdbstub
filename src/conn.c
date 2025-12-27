@@ -2,6 +2,7 @@
 #include <arpa/inet.h>
 #include <assert.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <stdio.h>
 #include <string.h>
@@ -35,6 +36,8 @@ bool conn_init(conn_t *conn, char *addr_str, int port)
 {
     if (!pktbuf_init(&conn->pktbuf))
         return false;
+
+    conn->no_ack_mode = false;
 
     struct in_addr addr_ip;
     if (inet_aton(addr_str, &addr_ip) != 0) {
@@ -85,6 +88,10 @@ bool conn_init(conn_t *conn, char *addr_str, int port)
         goto fail;
     }
 
+    /* Disable Nagle's algorithm - send packets immediately without buffering */
+    int nodelay = 1;
+    setsockopt(conn->socket_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
     return true;
 
 fail:
@@ -97,11 +104,14 @@ void conn_recv_packet(conn_t *conn)
     while (!pktbuf_is_complete(&conn->pktbuf) &&
            socket_readable(conn->socket_fd, -1)) {
         ssize_t nread = pktbuf_fill_from_file(&conn->pktbuf, conn->socket_fd);
-        if (nread == -1)
+        if (nread <= 0)  // 0 = EOF (connection closed), -1 = error
             break;
     }
 
-    conn_send_str(conn, STR_ACK);
+    // Only send ACK if not in NoAckMode
+    if (!conn->no_ack_mode) {
+        conn_send_str(conn, STR_ACK);
+    }
 }
 
 packet_t *conn_pop_packet(conn_t *conn)
@@ -137,6 +147,7 @@ void conn_send_str(conn_t *conn, char *str)
         ssize_t nwrite = write(conn->socket_fd, str, len);
         if (nwrite == -1)
             break;
+        str += nwrite;  /* Advance pointer past written bytes */
         len -= nwrite;
     }
 }

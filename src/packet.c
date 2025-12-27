@@ -89,8 +89,13 @@ packet_t *pktbuf_pop_packet(pktbuf_t *pktbuf)
     pkt->end_pos = pktbuf->end_pos;
     pkt->data[old_pkt_size] = 0;
 
-    memmove(pktbuf->data, pktbuf->data + old_pkt_size + 1,
-            pktbuf->size - old_pkt_size);
+    /* Move remaining data to start of buffer
+     * BUG FIX: was using old_pkt_size + 1 which skipped one extra byte,
+     * corrupting the next packet when packets arrive back-to-back */
+    if (pktbuf->size > old_pkt_size) {
+        memmove(pktbuf->data, pktbuf->data + old_pkt_size,
+                pktbuf->size - old_pkt_size);
+    }
     pktbuf->size -= old_pkt_size;
     pktbuf->end_pos = -1;
     return pkt;
