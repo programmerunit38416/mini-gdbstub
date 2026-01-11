@@ -173,7 +173,7 @@ void conn_send_pktstr(conn_t *conn, char *pktstr)
     memcpy(packet + len + 2, csum_str, csum_len);
     packet[len + 2 + csum_len] = '\0';
 
-#ifdef DEBUG
+#ifdef GDBSTUB_VERBOSE
     printf("send packet = %s,", packet);
     printf(" checksum = %d\n", csum);
 #endif

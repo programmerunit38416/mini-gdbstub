@@ -638,7 +638,7 @@ static bool packet_csum_verify(packet_t *inpkt)
     uint8_t csum_expected;
     str_to_hex((char *) &inpkt->data[inpkt->end_pos - CSUM_SIZE + 1],
                &csum_expected, sizeof(uint8_t));
-#ifdef DEBUG
+#ifdef GDBSTUB_VERBOSE
     printf("csum rslt = %x / csum expected = %s / ", csum_rslt,
            &inpkt->data[inpkt->end_pos - CSUM_SIZE + 1]);
     printf("csum expected = %x \n", csum_expected);
